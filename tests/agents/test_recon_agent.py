@@ -480,10 +480,15 @@ class TestArgusAgentNmapPartialFailure:
 
         sf_mock.scan.return_value = _sf_ok("www.example.com", "api.example.com")
         hx_mock.probe.return_value = _hx_ok(probe_a, probe_b)
-        nm_mock.scan.side_effect = [
-            _nm_ok((80, "tcp", "http")),   # www succeeds
-            _nm_err("timeout"),            # api fails
-        ]
+
+        # Use target-based dispatch so results are deterministic under parallel
+        # execution (as_completed order is non-deterministic with real threads).
+        def _nmap_side_effect(target):
+            if target == "1.1.1.1":
+                return _nm_ok((80, "tcp", "http"))
+            return _nm_err("timeout")
+
+        nm_mock.scan.side_effect = _nmap_side_effect
 
         self.report = ArgusAgent(
             subfinder=sf_mock, httpx=hx_mock, nmap=nm_mock
@@ -650,3 +655,229 @@ class TestArgusAgentCommandRecording:
         r2 = agent.run("beta.com")
         assert r1.target == "alpha.com"
         assert r2.target == "beta.com"
+
+
+# ---------------------------------------------------------------------------
+# ArgusAgent — ScanSession phase updates
+# ---------------------------------------------------------------------------
+
+from agents.argus.scan_registry import ScanSession, clear_registry, create_session
+
+
+@pytest.fixture(autouse=False)
+def clean_registry():
+    yield
+    clear_registry()
+
+
+class TestArgusAgentSessionUpdates:
+    """Verify that run() updates a ScanSession at each phase boundary."""
+
+    def _make_agent(self, sf_result=None, hx_result=None, nm_result=None):
+        sf = MagicMock()
+        sf.scan.return_value = sf_result or _sf_ok("www.example.com")
+        hx = MagicMock()
+        hx.probe.return_value = hx_result or _hx_ok()
+        nm = MagicMock()
+        nm.scan.return_value = nm_result or _nm_ok()
+        return ArgusAgent(subfinder=sf, httpx=hx, nmap=nm)
+
+    def test_session_status_complete_after_run(self, clean_registry):
+        session = create_session("example.com")
+        self._make_agent().run("example.com", session=session)
+        assert session.status == "complete"
+
+    def test_session_phase_done_after_run(self, clean_registry):
+        session = create_session("example.com")
+        self._make_agent().run("example.com", session=session)
+        assert session.phase == "done"
+
+    def test_session_completed_at_set(self, clean_registry):
+        session = create_session("example.com")
+        self._make_agent().run("example.com", session=session)
+        assert session.completed_at is not None
+
+    def test_session_discovered_domains_updated(self, clean_registry):
+        session = create_session("example.com")
+        self._make_agent(
+            sf_result=_sf_ok("a.example.com", "b.example.com", "c.example.com")
+        ).run("example.com", session=session)
+        assert session.discovered_domains == 3
+
+    def test_session_live_count_updated(self, clean_registry):
+        probe = _hx_probe("www.example.com")
+        session = create_session("example.com")
+        self._make_agent(hx_result=_hx_ok(probe)).run("example.com", session=session)
+        assert session.live_count == 1
+
+    def test_session_port_count_updated(self, clean_registry):
+        probe = _hx_probe("www.example.com")
+        session = create_session("example.com")
+        self._make_agent(
+            hx_result=_hx_ok(probe),
+            nm_result=_nm_ok((80, "tcp", "http"), (443, "tcp", "https")),
+        ).run("example.com", session=session)
+        assert session.port_count == 2
+
+    def test_session_errors_populated_on_failure(self, clean_registry):
+        session = create_session("example.com")
+        self._make_agent(sf_result=_sf_err("bad network")).run(
+            "example.com", session=session
+        )
+        assert any("bad network" in e for e in session.errors)
+
+    def test_session_summary_updated_after_run(self, clean_registry):
+        probe = _hx_probe("www.example.com")
+        session = create_session("example.com")
+        self._make_agent(hx_result=_hx_ok(probe)).run("example.com", session=session)
+        assert session.summary  # non-empty
+
+    def test_run_without_session_still_works(self):
+        """Passing no session must not raise."""
+        report = self._make_agent().run("example.com")
+        assert isinstance(report, ReconReport)
+
+    def test_session_highlights_populated_for_ssh_port(self, clean_registry):
+        probe = _hx_probe("dev.example.com", host_ip="1.2.3.4")
+        session = create_session("example.com")
+        self._make_agent(
+            sf_result=_sf_ok("dev.example.com"),
+            hx_result=_hx_ok(probe),
+            nm_result=_nm_ok((22, "tcp", "ssh")),
+        ).run("example.com", session=session)
+        assert any("SSH" in h or "dev" in h for h in session.highlights)
+
+    def test_httpx_failure_marks_session_complete(self, clean_registry):
+        session = create_session("example.com")
+        self._make_agent(hx_result=_hx_err("connection refused")).run(
+            "example.com", session=session
+        )
+        assert session.status == "complete"
+        assert session.phase == "done"
+
+
+# ---------------------------------------------------------------------------
+# ArgusAgent — parallel nmap
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+
+
+class TestArgusAgentParallelNmap:
+    """Verify _scan_hosts_parallel correctness and concurrency properties."""
+
+    def _make_agent_with_nm(self, nm_mock):
+        sf = MagicMock()
+        sf.scan.return_value = _sf_ok()
+        hx = MagicMock()
+        hx.probe.return_value = _hx_ok()
+        return ArgusAgent(subfinder=sf, httpx=hx, nmap=nm_mock)
+
+    def test_all_probes_scanned(self):
+        probes = [_hx_probe(f"h{i}.example.com", host_ip=f"1.2.3.{i}") for i in range(5)]
+        nm = MagicMock()
+        nm.scan.return_value = _nm_ok((80, "tcp", "http"))
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel(probes, errors)
+        assert nm.scan.call_count == 5
+
+    def test_all_hosts_returned(self):
+        probes = [_hx_probe(f"h{i}.example.com", host_ip=f"1.2.3.{i}") for i in range(4)]
+        nm = MagicMock()
+        nm.scan.return_value = _nm_ok((443, "tcp", "https"))
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel(probes, errors)
+        assert len(hosts) == 4
+        assert errors == []
+
+    def test_empty_probes_returns_empty(self):
+        nm = MagicMock()
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel([], errors)
+        assert hosts == []
+        nm.scan.assert_not_called()
+
+    def test_failed_probe_included_with_empty_ports(self):
+        probe = _hx_probe("www.example.com", host_ip="1.2.3.4")
+        nm = MagicMock()
+        nm.scan.return_value = _nm_err("timeout")
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel([probe], errors)
+        assert len(hosts) == 1
+        assert hosts[0].ports == []
+        assert len(errors) == 1
+
+    def test_partial_failure_error_recorded(self):
+        probe_ok = _hx_probe("ok.example.com", host_ip="1.1.1.1")
+        probe_bad = _hx_probe("bad.example.com", host_ip="2.2.2.2")
+        nm = MagicMock()
+
+        def _side(target):
+            return _nm_ok((80, "tcp", "http")) if target == "1.1.1.1" else _nm_err("refused")
+
+        nm.scan.side_effect = _side
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel([probe_ok, probe_bad], errors)
+        assert len(hosts) == 2
+        assert len(errors) == 1
+        assert any("refused" in e for e in errors)
+
+    def test_successful_host_has_ports(self):
+        probe = _hx_probe("www.example.com", host_ip="1.2.3.4")
+        nm = MagicMock()
+        nm.scan.return_value = _nm_ok((80, "tcp", "http"), (443, "tcp", "https"))
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel([probe], errors)
+        assert len(hosts[0].ports) == 2
+
+    def test_concurrency_bounded_by_max_workers(self):
+        """Verify simultaneous nmap calls never exceed max_workers."""
+        max_concurrent = 0
+        current = 0
+        lock = _threading.Lock()
+
+        def _slow_scan(target):
+            nonlocal max_concurrent, current
+            with lock:
+                current += 1
+                max_concurrent = max(max_concurrent, current)
+            import time as _t
+            _t.sleep(0.02)
+            with lock:
+                current -= 1
+            return _nm_ok((80, "tcp", "http"))
+
+        probes = [_hx_probe(f"h{i}.example.com", host_ip=f"1.2.3.{i}") for i in range(8)]
+        nm = MagicMock()
+        nm.scan.side_effect = _slow_scan
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        agent._scan_hosts_parallel(probes, errors, max_workers=3)
+        assert max_concurrent <= 3
+
+    def test_nmap_exception_becomes_error_not_crash(self):
+        probe = _hx_probe("www.example.com", host_ip="1.2.3.4")
+        nm = MagicMock()
+        nm.scan.side_effect = RuntimeError("unexpected crash")
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel([probe], errors)
+        assert len(hosts) == 1
+        assert hosts[0].ports == []
+        assert any("unexpected crash" in e for e in errors)
+
+    def test_technologies_propagated_from_probe(self):
+        probe = _hx_probe("www.example.com", host_ip="1.2.3.4", tech=["nginx", "react"])
+        nm = MagicMock()
+        nm.scan.return_value = _nm_ok()
+        agent = self._make_agent_with_nm(nm)
+        errors: list[str] = []
+        hosts = agent._scan_hosts_parallel([probe], errors)
+        assert "nginx" in hosts[0].technologies
+        assert "react" in hosts[0].technologies
